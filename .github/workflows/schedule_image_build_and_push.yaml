@@ -30,9 +30,15 @@ on:
         type: choice
         options:
           - main
+          - v0.17.0rc1
+          - v0.16.0rc1
           - v0.15.0rc1
           - v0.14.0rc1
           - v0.13.0rc3
+
+permissions:
+  packages: write
+  contents: read
 
 jobs:
   image_build:

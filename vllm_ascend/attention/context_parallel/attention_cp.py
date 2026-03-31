@@ -15,8 +15,6 @@
 # This file is a part of the vllm-ascend project.
 #
 
-from typing import ClassVar
-
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -29,10 +27,10 @@ from vllm.distributed import (
     get_decode_context_model_parallel_world_size,
     get_pcp_group,
 )
-from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackendImpl,
     AscendAttentionMetadataBuilder,
@@ -51,6 +49,7 @@ from vllm_ascend.attention.utils import (
     split_decodes_and_prefills,
 )
 from vllm_ascend.compilation.acl_graph import get_graph_params, update_graph_params_workspaces
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import cp_chunkedprefill_comm_stream, weak_ref_tensors
 
 
@@ -60,11 +59,6 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
 
     Extends AscendAttentionMetadataBuilder with PCP/DCP metadata handling.
     """
-
-    # Does this backend/builder reorder the batch?
-    # If not, set this to None. Otherwise set it to the query
-    # length that will be pulled into the front of the batch.
-    reorder_batch_threshold: ClassVar[int] = 1
 
     def __init__(
         self,
@@ -143,7 +137,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
         chunked_context_metadata = None
         attn_mask_seqlens = common_long_seq_metadata.attn_mask_seqlens
         if num_prefills > 0:
-            query_lens = query_lens[num_decode_tokens:]
+            query_lens = query_lens[num_decodes:]
             context_lens_cpu = num_computed_tokens_cpu[num_decodes:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             if self.chunked_prefill_enabled and max_context_len_cpu > 0:
@@ -239,6 +233,7 @@ class AscendAttentionCPMetadataBuilder(AscendAttentionMetadataBuilder):
             block_tables=block_table,
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
             seq_lens_list=seq_lens.tolist(),
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
@@ -559,9 +554,8 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
             "actual_seq_lengths": torch.arange(attn_metadata.num_decodes_flatten) + 1,
         }
         graph_params = get_graph_params()
-        forward_context: ForwardContext = get_forward_context()
         num_tokens = query.shape[0]
-        if forward_context.capturing:
+        if _EXTRA_CTX.capturing:
             stream = torch_npu.npu.current_stream()
 
             event = torch.npu.ExternalEvent()
@@ -760,12 +754,12 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
 
             if has_decode:
                 slot_mapping = attn_metadata.slot_mapping[: num_decode_tokens * self.pcp_size : self.pcp_size]
-                torch_npu._npu_reshape_and_cache(
+                DeviceOperator.reshape_and_cache(
                     key=key[:num_decode_tokens],
                     value=value[:num_decode_tokens],
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
-                    slot_indices=slot_mapping,
+                    slot_mapping=slot_mapping,
                 )
 
             if has_prefill:
@@ -792,12 +786,12 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                 slot_mapping = attn_metadata.slot_mapping[
                     self.pcp_size * num_decode_tokens : attn_metadata.num_actual_tokens_pcp_padded
                 ]
-                torch_npu._npu_reshape_and_cache(
+                DeviceOperator.reshape_and_cache(
                     key=prefill_key,
                     value=prefill_value,
                     key_cache=self.key_cache,
                     value_cache=self.value_cache,
-                    slot_indices=slot_mapping,
+                    slot_mapping=slot_mapping,
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
